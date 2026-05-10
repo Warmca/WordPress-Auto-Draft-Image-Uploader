@@ -55,12 +55,12 @@ logger = logging.getLogger("wp_uploader")
 class Config:
     """全局配置"""
     # WordPress配置
-    WP_DOMAIN = "domain"
-    WP_USER = "user"
-    WP_APP_PASSWORD = "password"
+    WP_DOMAIN = ""
+    WP_USER = ""
+    WP_APP_PASSWORD = ""
     
     # 本地目录
-    BASE_DIRECTORY = r"C:\Users\Tongxi\Pictures\写真预览"
+    BASE_DIRECTORY = r""
     DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wp_upload_history.db")
     
     # 异步上传配置
