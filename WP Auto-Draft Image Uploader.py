@@ -11,8 +11,7 @@ WordPress 异步高性能图片上传工具 v3.2
 import os
 import sys
 import re
-import json
-import time
+import html
 import base64
 import hashlib
 import sqlite3
@@ -21,23 +20,13 @@ import aiohttp
 import logging
 import threading
 import ctypes
-from pathlib import Path
+import random
 from PIL import Image
 from tqdm import tqdm
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Set
-from collections import OrderedDict
+from typing import Dict, List, Tuple, Optional
 from functools import lru_cache, cmp_to_key
-from contextlib import asynccontextmanager
 from enum import Enum
-import random
-
-# 可选依赖
-try:
-    from pypinyin import lazy_pinyin
-    HAS_PYPINYIN = True
-except ImportError:
-    HAS_PYPINYIN = False
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
@@ -54,19 +43,17 @@ logger = logging.getLogger("wp_uploader")
 # ==================== 配置 ====================
 class Config:
     """全局配置"""
-    # WordPress配置
-    WP_DOMAIN = ""
-    WP_USER = ""
-    WP_APP_PASSWORD = ""
+    # WordPress配置（优先从环境变量读取，避免凭据硬编码进源码）
+    WP_DOMAIN = os.environ.get("WP_DOMAIN", "")
+    WP_USER = os.environ.get("WP_USER", "")
+    WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
     
     # 本地目录
-    BASE_DIRECTORY = r""
+    BASE_DIRECTORY = r"C:\Users\Tongxi\Pictures\写真预览"
     DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wp_upload_history.db")
     
     # 异步上传配置
     MAX_CONCURRENT_UPLOADS = 15      # 最大并发上传数
-    MIN_CONCURRENT_UPLOADS = 3       # 最小并发上传数
-    INITIAL_CONCURRENT = 8           # 初始并发数
     
     # 超时配置（秒）
     UPLOAD_TIMEOUT = 60              # 上传超时
@@ -364,21 +351,22 @@ class DatabaseManager:
                     if "duplicate column name" not in str(e).lower():
                         logger.warning(f"添加列 {col_name} 失败: {e}")
         
-        # 更新现有记录的 folder_name（如果为空）
+        # 回填现有记录的 folder_name（为空时从 file_path 推导）
         try:
-            cursor.execute("""
-                UPDATE uploaded_images 
-                SET folder_name = (
-                    SELECT REPLACE(
-                        REPLACE(file_path, REPLACE(file_path, RTRIM(file_path, REPLACE(file_path, '\\', '')), ''), ''),
-                        '\\' || (SELECT REPLACE(file_path, RTRIM(file_path, REPLACE(file_path, '\\', '')), '') FROM uploaded_images AS sub WHERE sub.id = uploaded_images.id),
-                        ''
+            cursor.execute(
+                "SELECT id, file_path FROM uploaded_images "
+                "WHERE folder_name IS NULL OR folder_name = ''"
+            )
+            rows = cursor.fetchall()
+            for row in rows:
+                folder = os.path.basename(os.path.dirname(row[1]))
+                if folder:
+                    cursor.execute(
+                        "UPDATE uploaded_images SET folder_name = ? WHERE id = ?",
+                        (folder, row[0])
                     )
-                )
-                WHERE folder_name IS NULL OR folder_name = ''
-            """)
         except Exception as e:
-            logger.debug(f"更新folder_name时出错（可忽略）: {e}")
+            logger.debug(f"回填 folder_name 时出错（可忽略）: {e}")
         
         # 创建可能缺失的索引
         try:
@@ -422,28 +410,6 @@ class DatabaseManager:
         
         logger.info("数据库迁移完成")
     
-    def get_uploaded_by_hash(self, file_hash: str) -> Optional[Dict]:
-        """通过哈希查询已上传记录"""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM uploaded_images WHERE file_hash = ?",
-            (file_hash,)
-        )
-        row = cursor.fetchone()
-        return dict(row) if row else None
-    
-    def get_uploaded_by_path(self, file_path: str) -> Optional[Dict]:
-        """通过路径查询已上传记录"""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM uploaded_images WHERE file_path = ?",
-            (file_path,)
-        )
-        row = cursor.fetchone()
-        return dict(row) if row else None
-    
     def batch_check_uploaded(self, images: List[ImageFile]) -> Dict[str, Dict]:
         """批量检查已上传状态，返回 {file_path: record}"""
         if not images:
@@ -486,53 +452,6 @@ class DatabaseManager:
                 results[record['file_path']] = record
         
         return results
-    
-    def record_upload(self, image: ImageFile, media_url: str = None, 
-                      server_filename: str = None, verified: bool = False):
-        """记录单个上传"""
-        with self._write_lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            
-            # 先检查是否存在
-            cursor.execute(
-                "SELECT id FROM uploaded_images WHERE file_path = ? OR file_hash = ?",
-                (image.path, image.file_hash)
-            )
-            existing = cursor.fetchone()
-            
-            if existing:
-                cursor.execute('''
-                    UPDATE uploaded_images 
-                    SET media_id = ?, media_url = ?, server_filename = ?, 
-                        folder_name = ?, upload_time = CURRENT_TIMESTAMP, verified = ?
-                    WHERE id = ?
-                ''', (
-                    image.media_id,
-                    media_url or image.media_url,
-                    server_filename or image.name,
-                    image.folder_name,
-                    1 if verified else 0,
-                    existing['id']
-                ))
-            else:
-                cursor.execute('''
-                    INSERT INTO uploaded_images 
-                    (file_path, file_hash, file_name, media_id, media_url, 
-                     server_filename, folder_name, upload_time, verified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-                ''', (
-                    image.path,
-                    image.file_hash,
-                    image.name,
-                    image.media_id,
-                    media_url or image.media_url,
-                    server_filename or image.name,
-                    image.folder_name,
-                    1 if verified else 0
-                ))
-            
-            conn.commit()
     
     def batch_record_uploads(self, images: List[ImageFile]):
         """批量记录上传"""
@@ -582,20 +501,6 @@ class DatabaseManager:
                         1 if img.status == UploadStatus.VERIFIED else 0
                     ))
             
-            conn.commit()
-    
-    def mark_verified(self, media_ids: List[int]):
-        """标记为已验证"""
-        if not media_ids:
-            return
-        
-        with self._write_lock:
-            conn = self._get_connection()
-            placeholders = ','.join(['?'] * len(media_ids))
-            conn.execute(
-                f"UPDATE uploaded_images SET verified = 1 WHERE media_id IN ({placeholders})",
-                media_ids
-            )
             conn.commit()
     
     def is_post_created(self, folder_name: str) -> Optional[int]:
@@ -648,29 +553,6 @@ class DatabaseManager:
                 conn.commit()
             except Exception as e:
                 logger.error(f"记录错误失败: {e}")
-    
-    def get_failed_folders(self) -> List[str]:
-        """获取失败的文件夹"""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT DISTINCT item_path 
-            FROM error_logs 
-            WHERE operation_type = 'create_post' 
-            AND item_path NOT IN (SELECT folder_name FROM created_posts)
-            ORDER BY error_time DESC
-        """)
-        return [row['item_path'] for row in cursor.fetchall()]
-    
-    def get_folder_uploaded_images(self, folder_name: str) -> List[Dict]:
-        """获取文件夹已上传的图片"""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM uploaded_images WHERE folder_name = ? ORDER BY file_path",
-            (folder_name,)
-        )
-        return [dict(row) for row in cursor.fetchall()]
 
 
 # ==================== 异步上传器 ====================
@@ -680,9 +562,6 @@ class AsyncUploader:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
         self._semaphore: Optional[asyncio.Semaphore] = None
-        self._current_concurrency = Config.INITIAL_CONCURRENT
-        self._success_count = 0
-        self._fail_count = 0
         self._session: Optional[aiohttp.ClientSession] = None
     
     async def _ensure_session(self) -> aiohttp.ClientSession:
@@ -840,7 +719,17 @@ class AsyncUploader:
                         retry_after = int(response.headers.get('Retry-After', 5))
                         await asyncio.sleep(retry_after)
                         continue
-                    
+
+                    elif 400 <= response.status < 500:
+                        # 客户端错误（认证、权限、请求格式等），重试无意义，立即返回
+                        text = await response.text()
+                        logger.error(f"上传失败（不可重试）[{response.status}]: {image.name}")
+                        logger.debug(f"响应: {text[:200]}")
+                        return UploadResult(
+                            success=False,
+                            error=f"客户端错误 {response.status}"
+                        )
+
                     else:
                         text = await response.text()
                         logger.warning(f"上传失败 [{response.status}]: {image.name}")
@@ -987,36 +876,29 @@ class AsyncUploader:
         if not need_upload:
             return images
         
-        # 第三步：并发上传
-        self._semaphore = asyncio.Semaphore(self._current_concurrency)
-        self._success_count = 0
-        self._fail_count = 0
-        
+        # 第三步：并发上传（固定信号量，并发上限由 Config 与 TCPConnector 共同保证）
+        self._semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_UPLOADS)
+
         # 创建进度条
         pbar = tqdm(total=len(need_upload), desc="上传进度", leave=True)
-        
+
         async def upload_with_semaphore(img: ImageFile):
             async with self._semaphore:
                 result = await self.upload_single_image(img)
-                
+
                 if result.success:
                     img.media_id = result.media_id
                     img.media_url = result.media_url
                     img.status = UploadStatus.UPLOADED
-                    self._success_count += 1
                 else:
                     img.status = UploadStatus.FAILED
                     img.error_message = result.error
-                    self._fail_count += 1
-                
+
                 pbar.update(1)
-                
-                # 动态调整并发数
-                await self._adjust_concurrency()
-                
+
                 # 请求间隔
                 await asyncio.sleep(Config.REQUEST_DELAY)
-                
+
                 return img
         
         # 执行并发上传
@@ -1032,8 +914,7 @@ class AsyncUploader:
         if uploaded_ids:
             logger.info(f"验证 {len(uploaded_ids)} 个新上传媒体...")
             verify_results = await self.verify_media_batch(uploaded_ids)
-            
-            verified_images = []
+
             for img in need_upload:
                 if img.media_id and img.media_id in verify_results:
                     result = verify_results[img.media_id]
@@ -1041,16 +922,18 @@ class AsyncUploader:
                         img.status = UploadStatus.VERIFIED
                         if 'large_url' in result:
                             img.media_url = result['large_url']
-                        verified_images.append(img)
                     else:
-                        img.status = UploadStatus.FAILED
+                        # 已上传到服务器但本次验证失败（常为瞬时问题），
+                        # 本次文章不嵌入，但仍记库以避免下次重复上传。
+                        img.status = UploadStatus.UPLOADED
                         img.error_message = "上传后验证失败"
-                        self._fail_count += 1
-                        self._success_count -= 1
-            
-            # 批量写入数据库
-            if verified_images:
-                self.db.batch_record_uploads(verified_images)
+
+        # 落库：所有已拿到 media_id 的图片都记录。
+        # verified 标记由 batch_record_uploads 依据 status==VERIFIED 写入，
+        # 未通过验证的以 verified=0 入库，下次运行复核而非重传。
+        recorded_images = [img for img in need_upload if img.media_id]
+        if recorded_images:
+            self.db.batch_record_uploads(recorded_images)
         
         # 统计
         total_success = sum(1 for img in images if img.status == UploadStatus.VERIFIED)
@@ -1061,27 +944,6 @@ class AsyncUploader:
         
         # 按原始顺序返回
         return sorted(images, key=lambda x: x.index)
-    
-    async def _adjust_concurrency(self):
-        """动态调整并发数"""
-        total = self._success_count + self._fail_count
-        if total < 10:
-            return
-        
-        success_rate = self._success_count / total
-        
-        if success_rate > 0.95 and self._current_concurrency < Config.MAX_CONCURRENT_UPLOADS:
-            self._current_concurrency = min(
-                self._current_concurrency + 2,
-                Config.MAX_CONCURRENT_UPLOADS
-            )
-            self._semaphore = asyncio.Semaphore(self._current_concurrency)
-        elif success_rate < 0.7 and self._current_concurrency > Config.MIN_CONCURRENT_UPLOADS:
-            self._current_concurrency = max(
-                self._current_concurrency - 1,
-                Config.MIN_CONCURRENT_UPLOADS
-            )
-            self._semaphore = asyncio.Semaphore(self._current_concurrency)
 
 
 # ==================== 文章创建器 ====================
@@ -1122,16 +984,17 @@ class PostCreator:
             return ""
         
         content_parts = []
-        
+
         for display_idx, img in enumerate(sorted_images):
-            alt_text = img.get_alt_text_with_index(display_idx)
-            escaped_alt = alt_text.replace('"', '\\"')
-            
+            alt_text = html.escape(img.get_alt_text_with_index(display_idx), quote=True)
+            title = html.escape(img.clean_filename, quote=True)
+            src = html.escape(img.media_url, quote=True)
+
             # WordPress Gutenberg图片块
             block = f'''<!-- wp:image {{"id":{img.media_id},"sizeSlug":"large","linkDestination":"none"}} -->
-<figure class="wp-block-image size-large"><img src="{img.media_url}" alt="{alt_text}" class="wp-image-{img.media_id}" title="{img.clean_filename}"/></figure>
+<figure class="wp-block-image size-large"><img src="{src}" alt="{alt_text}" class="wp-image-{img.media_id}" title="{title}"/></figure>
 <!-- /wp:image -->'''
-            
+
             content_parts.append(block)
         
         return '\n\n'.join(content_parts)
@@ -1154,6 +1017,31 @@ class PostCreator:
         # 没有横向图片，选最后一张
         return verified_images[-1].media_id
     
+    async def _find_existing_post_by_title(self, title: str) -> Optional[int]:
+        """按标题在 WP 上查询是否已存在同名文章（含草稿），避免重试产生重复"""
+        session = await self._ensure_session()
+        try:
+            async with session.get(
+                f"{WP_API_URL}/posts",
+                params={
+                    'search': title,
+                    'status': 'draft,publish,pending,private',
+                    'per_page': 20,
+                    '_fields': 'id,title',
+                },
+                timeout=aiohttp.ClientTimeout(total=Config.VERIFY_TIMEOUT)
+            ) as response:
+                if response.status != 200:
+                    return None
+                for item in await response.json():
+                    rendered = item.get('title', {}).get('rendered', '')
+                    # WP 会对标题做 HTML 转义，比较时还原
+                    if html.unescape(rendered).strip() == title.strip():
+                        return item.get('id')
+        except Exception as e:
+            logger.debug(f"查询同名文章失败（可忽略）: {e}")
+        return None
+
     async def create_draft_post(self, folder_name: str, content: str,
                                 featured_image_id: Optional[int] = None,
                                 media_ids: List[int] = None) -> Optional[int]:
@@ -1163,58 +1051,68 @@ class PostCreator:
         if existing:
             logger.info(f"文章已存在，ID: {existing}")
             return existing
-        
+
         if not content or not content.strip():
             logger.error("文章内容为空")
             return None
-        
+
         post_data = {
             'title': folder_name,
             'content': content,
             'status': 'draft',
         }
-        
+
         if featured_image_id:
             post_data['featured_media'] = featured_image_id
-        
+
         session = await self._ensure_session()
-        
+
         for attempt in range(Config.MAX_RETRIES):
+            # 重试前先核查 WP 是否已有同名文章：上一轮可能创建成功但响应丢失，
+            # 直接重发会产生重复草稿。
+            if attempt > 0:
+                existing_id = await self._find_existing_post_by_title(folder_name)
+                if existing_id:
+                    logger.info(f"检测到已存在同名文章，ID: {existing_id}，跳过重复创建")
+                    image_count = len(media_ids) if media_ids else 0
+                    self.db.record_post_creation(folder_name, existing_id, image_count)
+                    return existing_id
+
             try:
                 async with session.post(
                     f"{WP_API_URL}/posts",
                     json=post_data
                 ) as response:
-                    
+
                     if response.status in [200, 201]:
                         data = await response.json()
                         post_id = data.get('id')
-                        
+
                         if post_id and post_id > 0:
                             logger.info(f"草稿创建成功，ID: {post_id}")
-                            
+
                             # 记录到数据库
                             image_count = len(media_ids) if media_ids else 0
                             self.db.record_post_creation(folder_name, post_id, image_count)
-                            
+
                             # 附加媒体
                             if media_ids:
                                 await self._attach_media_batch(post_id, media_ids)
-                            
+
                             return post_id
-                    
+
                     else:
                         text = await response.text()
                         logger.error(f"创建文章失败 [{response.status}]: {text[:200]}")
-                
+
                 if attempt < Config.MAX_RETRIES - 1:
                     await asyncio.sleep(2 * (attempt + 1))
-                    
+
             except Exception as e:
                 logger.error(f"创建文章异常: {e}")
                 if attempt < Config.MAX_RETRIES - 1:
                     await asyncio.sleep(2 * (attempt + 1))
-        
+
         self.db.record_error("create_post", folder_name, "创建失败")
         return None
     
@@ -1224,18 +1122,20 @@ class PostCreator:
             return
         
         session = await self._ensure_session()
-        
+        semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_UPLOADS)
+
         async def attach_single(media_id: int) -> bool:
-            try:
-                async with session.post(
-                    f"{WP_API_URL}/media/{media_id}",
-                    json={'post': post_id}
-                ) as response:
-                    return response.status in [200, 201]
-            except Exception:
-                return False
-        
-        # 并发附加
+            async with semaphore:
+                try:
+                    async with session.post(
+                        f"{WP_API_URL}/media/{media_id}",
+                        json={'post': post_id}
+                    ) as response:
+                        return response.status in [200, 201]
+                except Exception:
+                    return False
+
+        # 并发附加（受信号量限流）
         tasks = [attach_single(mid) for mid in media_ids]
         results = await asyncio.gather(*tasks)
         
@@ -1567,8 +1467,14 @@ async def main():
     logger.info("WordPress异步上传工具 v3.2")
     logger.info("="*50)
     
+    # 校验凭据已配置
+    if not Config.WP_APP_PASSWORD.strip():
+        logger.error("未配置 WordPress 应用密码")
+        logger.error("请设置环境变量 WP_APP_PASSWORD（可选 WP_DOMAIN / WP_USER）后重试")
+        return
+
     processor = FolderProcessor()
-    
+
     try:
         # 测试连接
         if not await processor.uploader.test_connection():
@@ -1601,10 +1507,10 @@ async def main():
 def run():
     """同步入口点"""
     try:
-        # Windows需要设置事件循环策略
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        
+        # Windows 下使用默认的 ProactorEventLoop。
+        # 不要强制 SelectorEventLoop：Python 3.12+ 在 Windows 上用 Selector 跑
+        # HTTPS（SSL 写入）时，_SelectorSocketTransport._write_send 会触发
+        # "AssertionError: Data should not be empty"，导致 POST 上传全部失败。
         asyncio.run(main())
     
     except KeyboardInterrupt:
